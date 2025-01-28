@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -11,20 +13,30 @@ import (
 )
 
 type handler struct {
-	*testing.T
-	cancel context.CancelFunc
+	messageCh chan *ConsumerMessage
 }
 
 func (h *handler) Setup(s ConsumerGroupSession) error   { return nil }
 func (h *handler) Cleanup(s ConsumerGroupSession) error { return nil }
 func (h *handler) ConsumeClaim(sess ConsumerGroupSession, claim ConsumerGroupClaim) error {
-	for msg := range claim.Messages() {
-		sess.MarkMessage(msg, "")
-		h.Logf("consumed msg %v", msg)
-		h.cancel()
-		break
+	for {
+		select {
+		case msg := <-claim.Messages():
+			sess.MarkMessage(msg, "")
+			h.messageCh <- msg
+		case <-sess.Context().Done():
+			h.messageCh <- &ConsumerMessage{Value: []byte("session done")}
+			return nil
+		}
 	}
-	return nil
+}
+
+func TestNewConsumerGroupFromClient(t *testing.T) {
+	t.Run("should not permit nil client", func(t *testing.T) {
+		group, err := NewConsumerGroupFromClient("group", nil)
+		assert.Nil(t, group)
+		assert.Error(t, err)
+	})
 }
 
 // TestConsumerGroupNewSessionDuringOffsetLoad ensures that the consumer group
@@ -37,9 +49,11 @@ func TestConsumerGroupNewSessionDuringOffsetLoad(t *testing.T) {
 	config.Version = V2_0_0_0
 	config.Consumer.Return.Errors = true
 	config.Consumer.Group.Rebalance.Retry.Max = 2
+	config.Consumer.Group.Rebalance.Retry.Backoff = 0
 	config.Consumer.Offsets.AutoCommit.Enable = false
 
 	broker0 := NewMockBroker(t, 0)
+	defer broker0.Close()
 
 	broker0.SetHandlerByMap(map[string]MockResponse{
 		"MetadataRequest": NewMockMetadataResponse(t).
@@ -70,9 +84,9 @@ func TestConsumerGroupNewSessionDuringOffsetLoad(t *testing.T) {
 		).SetError(ErrNoError),
 		"FetchRequest": NewMockSequence(
 			NewMockFetchResponse(t, 1).
-				SetMessage("my-topic", 0, 0, StringEncoder("foo")).
+				SetMessage("my-topic", 0, 0, StringEncoder("foo")),
+			NewMockFetchResponse(t, 1).
 				SetMessage("my-topic", 0, 1, StringEncoder("bar")),
-			NewMockFetchResponse(t, 1),
 		),
 	})
 
@@ -80,89 +94,69 @@ func TestConsumerGroupNewSessionDuringOffsetLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = group.Close() }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	h := &handler{t, cancel}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
+	ctx := context.Background()
+	h := &handler{make(chan *ConsumerMessage)}
+	defer close(h.messageCh)
 
 	go func() {
 		topics := []string{"my-topic"}
 		if err := group.Consume(ctx, topics, h); err != nil {
 			t.Error(err)
 		}
-		wg.Done()
 	}()
-	wg.Wait()
+
+	assert.Equal(t, "foo", string((<-h.messageCh).Value))
+	assert.Equal(t, "bar", string((<-h.messageCh).Value))
+	go func() {
+		if err := group.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	assert.Equal(t, "session done", string((<-h.messageCh).Value))
 }
 
 func TestConsume_RaceTest(t *testing.T) {
-	const groupID = "test-group"
-	const topic = "test-topic"
-	const offsetStart = int64(1234)
+	const (
+		groupID     = "test-group"
+		topic       = "test-topic"
+		offsetStart = int64(1234)
+	)
 
-	cfg := NewConfig()
+	cfg := NewTestConfig()
 	cfg.Version = V2_8_1_0
 	cfg.Consumer.Return.Errors = true
+	cfg.Metadata.Full = true
 
 	seedBroker := NewMockBroker(t, 1)
-
-	joinGroupResponse := &JoinGroupResponse{}
-
-	syncGroupResponse := &SyncGroupResponse{
-		Version: 3, // sarama > 2.3.0.0 uses version 3
-	}
-	// Leverage mock response to get the MemberAssignment bytes
-	mockSyncGroupResponse := NewMockSyncGroupResponse(t).SetMemberAssignment(&ConsumerGroupMemberAssignment{
-		Version:  1,
-		Topics:   map[string][]int32{topic: {0}}, // map "test-topic" to partition 0
-		UserData: []byte{0x01},
-	})
-	syncGroupResponse.MemberAssignment = mockSyncGroupResponse.MemberAssignment
-
-	heartbeatResponse := &HeartbeatResponse{
-		Err: ErrNoError,
-	}
-	offsetFetchResponse := &OffsetFetchResponse{
-		Version:        1,
-		ThrottleTimeMs: 0,
-		Err:            ErrNoError,
-	}
-	offsetFetchResponse.AddBlock(topic, 0, &OffsetFetchResponseBlock{
-		Offset:      offsetStart,
-		LeaderEpoch: 0,
-		Metadata:    "",
-		Err:         ErrNoError})
-
-	offsetResponse := &OffsetResponse{
-		Version: 1,
-	}
-	offsetResponse.AddTopicPartition(topic, 0, offsetStart)
-
-	metadataResponse := new(MetadataResponse)
-	metadataResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
-	metadataResponse.AddTopic("mismatched-topic", ErrUnknownTopicOrPartition)
+	defer seedBroker.Close()
 
 	handlerMap := map[string]MockResponse{
 		"ApiVersionsRequest": NewMockApiVersionsResponse(t),
-		"MetadataRequest":    NewMockSequence(metadataResponse),
-		"OffsetRequest":      NewMockSequence(offsetResponse),
-		"OffsetFetchRequest": NewMockSequence(offsetFetchResponse),
-		"FindCoordinatorRequest": NewMockSequence(NewMockFindCoordinatorResponse(t).
-			SetCoordinator(CoordinatorGroup, groupID, seedBroker)),
-		"JoinGroupRequest": NewMockSequence(joinGroupResponse),
-		"SyncGroupRequest": NewMockSequence(syncGroupResponse),
-		"HeartbeatRequest": NewMockSequence(heartbeatResponse),
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+			SetError("mismatched-topic", ErrUnknownTopicOrPartition),
+		"OffsetRequest": NewMockOffsetResponse(t).
+			SetOffset(topic, 0, -1, offsetStart),
+		"OffsetFetchRequest": NewMockOffsetFetchResponse(t).
+			SetOffset(groupID, topic, 0, offsetStart, "", ErrNoError),
+		"FindCoordinatorRequest": NewMockFindCoordinatorResponse(t).
+			SetCoordinator(CoordinatorGroup, groupID, seedBroker),
+		"JoinGroupRequest": NewMockJoinGroupResponse(t),
+		"SyncGroupRequest": NewMockSyncGroupResponse(t).SetMemberAssignment(
+			&ConsumerGroupMemberAssignment{
+				Version:  1,
+				Topics:   map[string][]int32{topic: {0}}, // map "test-topic" to partition 0
+				UserData: []byte{0x01},
+			},
+		),
+		"HeartbeatRequest": NewMockHeartbeatResponse(t),
 	}
 	seedBroker.SetHandlerByMap(handlerMap)
 
-	cancelCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(4*time.Second))
+	cancelCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second))
 
-	defer seedBroker.Close()
-
-	retryWait := 20 * time.Millisecond
+	retryWait := 10 * time.Millisecond
 	var err error
 	clientRetries := 0
 outerFor:
@@ -192,8 +186,8 @@ outerFor:
 		t.Fatalf("should not proceed to Consume")
 	}
 
-	if clientRetries <= 0 {
-		t.Errorf("clientRetries = %v; want > 0", clientRetries)
+	if clientRetries <= 1 {
+		t.Errorf("clientRetries = %v; want > 1", clientRetries)
 	}
 
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
@@ -215,6 +209,7 @@ func TestConsumerGroupSessionDoesNotRetryForever(t *testing.T) {
 	config.Consumer.Group.Rebalance.Retry.Backoff = 0
 
 	broker0 := NewMockBroker(t, 0)
+	defer broker0.Close()
 
 	broker0.SetHandlerByMap(map[string]MockResponse{
 		"MetadataRequest": NewMockMetadataResponse(t).
@@ -230,8 +225,8 @@ func TestConsumerGroupSessionDoesNotRetryForever(t *testing.T) {
 	}
 	defer func() { _ = group.Close() }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	h := &handler{t, cancel}
+	ctx := context.Background()
+	h := &handler{}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -244,4 +239,16 @@ func TestConsumerGroupSessionDoesNotRetryForever(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestConsumerShouldNotRetrySessionIfContextCancelled(t *testing.T) {
+	c := &consumerGroup{
+		config: NewTestConfig(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.newSession(ctx, nil, nil, 1024)
+	assert.Equal(t, context.Canceled, err)
+	_, err = c.retryNewSession(ctx, nil, nil, 1024, true)
+	assert.Equal(t, context.Canceled, err)
 }

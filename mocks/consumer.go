@@ -204,8 +204,10 @@ func (c *Consumer) SetTopicMetadata(metadata map[string][]int32) {
 // The registered PartitionConsumer will be returned, so you can set expectations
 // on it using method chaining. Once a topic/partition is registered, you are
 // expected to start consuming it using ConsumePartition. If that doesn't happen,
-// an error will be written to the error reporter once the mock consumer is closed. It will
-// also expect that the
+// an error will be written to the error reporter once the mock consumer is closed. It also expects
+// that the message and error channels be written with YieldMessage and YieldError accordingly,
+// and be fully consumed once the mock consumer is closed if ExpectMessagesDrainedOnClose or
+// ExpectErrorsDrainedOnClose have been called.
 func (c *Consumer) ExpectConsumePartition(topic string, partition int32, offset int64) *PartitionConsumer {
 	c.l.Lock()
 	defer c.l.Unlock()
@@ -246,6 +248,7 @@ func (c *Consumer) ExpectConsumePartition(topic string, partition int32, offset 
 // channels using YieldMessage and YieldError.
 type PartitionConsumer struct {
 	highWaterMarkOffset           int64 // must be at the top of the struct because https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	suppressedHighWaterMarkOffset int64
 	l                             sync.Mutex
 	t                             ErrorReporter
 	topic                         string
@@ -253,7 +256,6 @@ type PartitionConsumer struct {
 	offset                        int64
 	messages                      chan *sarama.ConsumerMessage
 	suppressedMessages            chan *sarama.ConsumerMessage
-	suppressedHighWaterMarkOffset int64
 	errors                        chan *sarama.ConsumerError
 	singleClose                   sync.Once
 	consumed                      bool

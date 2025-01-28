@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -87,7 +89,7 @@ func TestTxnmgrInitProducerIdTxn(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	broker.Returns(metadataLeader)
@@ -116,6 +118,53 @@ func TestTxnmgrInitProducerIdTxn(t *testing.T) {
 		ProducerEpoch: 0,
 	}
 	broker.Returns(producerIdResponse)
+
+	txmng, err := newTransactionManager(config, client)
+	require.NoError(t, err)
+
+	require.Equal(t, int64(1), txmng.producerID)
+	require.Equal(t, int16(0), txmng.producerEpoch)
+	require.Equal(t, ProducerTxnFlagReady, txmng.status)
+}
+
+// TestTxnmgrInitProducerIdTxnCoordinatorLoading ensure we retry initProducerId when either FindCoordinator or InitProducerID returns ErrOffsetsLoadInProgress
+func TestTxnmgrInitProducerIdTxnCoordinatorLoading(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = true
+	config.Producer.Transaction.ID = "txid-group"
+	config.Version = V0_11_0_0
+	config.Producer.RequiredAcks = WaitForAll
+	config.Net.MaxOpenRequests = 1
+
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+
+	broker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(broker.BrokerID()).
+			SetBroker(broker.Addr(), broker.BrokerID()),
+		"FindCoordinatorRequest": NewMockSequence(
+			NewMockFindCoordinatorResponse(t).
+				SetError(CoordinatorTransaction, "txid-group", ErrOffsetsLoadInProgress),
+			NewMockFindCoordinatorResponse(t).
+				SetError(CoordinatorTransaction, "txid-group", ErrOffsetsLoadInProgress),
+			NewMockFindCoordinatorResponse(t).
+				SetCoordinator(CoordinatorTransaction, "txid-group", broker),
+		),
+		"InitProducerIDRequest": NewMockSequence(
+			NewMockInitProducerIDResponse(t).
+				SetError(ErrOffsetsLoadInProgress),
+			NewMockInitProducerIDResponse(t).
+				SetError(ErrOffsetsLoadInProgress),
+			NewMockInitProducerIDResponse(t).
+				SetProducerID(1).
+				SetProducerEpoch(0),
+		),
+	})
+
+	client, err := NewClient([]string{broker.Addr()}, config)
+	require.NoError(t, err)
+	defer client.Close()
 
 	txmng, err := newTransactionManager(config, client)
 	require.NoError(t, err)
@@ -217,7 +266,7 @@ func TestMaybeAddPartitionToCurrentTxn(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -351,7 +400,7 @@ func TestAddOffsetsToTxn(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -608,7 +657,7 @@ func TestTxnOffsetsCommit(t *testing.T) {
 	config.Producer.Transaction.Retry.Backoff = 0
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -739,7 +788,7 @@ func TestEndTxn(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -904,7 +953,7 @@ func TestPublishPartitionToTxn(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)

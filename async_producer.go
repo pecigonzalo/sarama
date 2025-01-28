@@ -13,6 +13,20 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
+// ErrProducerRetryBufferOverflow is returned when the bridging retry buffer is full and OOM prevention needs to be applied.
+var ErrProducerRetryBufferOverflow = errors.New("retry buffer full: message discarded to prevent buffer overflow")
+
+const (
+	// minFunctionalRetryBufferLength defines the minimum number of messages the retry buffer must support.
+	// If Producer.Retry.MaxBufferLength is set to a non-zero value below this limit, it will be adjusted to this value.
+	// This ensures the retry buffer remains functional under typical workloads.
+	minFunctionalRetryBufferLength = 4 * 1024
+	// minFunctionalRetryBufferBytes defines the minimum total byte size the retry buffer must support.
+	// If Producer.Retry.MaxBufferBytes is set to a non-zero value below this limit, it will be adjusted to this value.
+	// A 32 MB lower limit ensures sufficient capacity for retrying larger messages without exhausting resources.
+	minFunctionalRetryBufferBytes = 32 * 1024 * 1024
+)
+
 // AsyncProducer publishes Kafka messages using a non-blocking API. It routes messages
 // to the correct broker for the provided topic-partition, refreshing metadata as appropriate,
 // and parses responses for errors. You must read from the Errors() channel or the
@@ -20,7 +34,6 @@ import (
 // leaks and message lost: it will not be garbage-collected automatically when it passes
 // out of scope and buffered messages may not be flushed.
 type AsyncProducer interface {
-
 	// AsyncClose triggers a shutdown of the producer. The shutdown has completed
 	// when both the Errors and Successes channels have been closed. When calling
 	// AsyncClose, you *must* continue to read from those channels in order to
@@ -50,7 +63,7 @@ type AsyncProducer interface {
 	// errors to be returned.
 	Errors() <-chan *ProducerError
 
-	// IsTransactional return true when current producer is is transactional.
+	// IsTransactional return true when current producer is transactional.
 	IsTransactional() bool
 
 	// TxnStatus return current producer transaction status.
@@ -366,17 +379,17 @@ func (p *asyncProducer) Close() error {
 		})
 	}
 
-	var errors ProducerErrors
+	var pErrs ProducerErrors
 	if p.conf.Producer.Return.Errors {
 		for event := range p.errors {
-			errors = append(errors, event)
+			pErrs = append(pErrs, event)
 		}
 	} else {
 		<-p.errors
 	}
 
-	if len(errors) > 0 {
-		return errors
+	if len(pErrs) > 0 {
+		return pErrs
 	}
 	return nil
 }
@@ -450,8 +463,10 @@ func (p *asyncProducer) dispatcher() {
 			p.returnError(msg, ConfigurationError("Producing headers requires Kafka at least v0.11"))
 			continue
 		}
-		if msg.ByteSize(version) > p.conf.Producer.MaxMessageBytes {
-			p.returnError(msg, ErrMessageSizeTooLarge)
+
+		size := msg.ByteSize(version)
+		if size > p.conf.Producer.MaxMessageBytes {
+			p.returnError(msg, ConfigurationError(fmt.Sprintf("Attempt to produce message larger than configured Producer.MaxMessageBytes: %d > %d", size, p.conf.Producer.MaxMessageBytes)))
 			continue
 		}
 
@@ -1100,7 +1115,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 			bp.parent.returnSuccesses(pSet.msgs)
 		// Retriable errors
 		case ErrInvalidMessage, ErrUnknownTopicOrPartition, ErrLeaderNotAvailable, ErrNotLeaderForPartition,
-			ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend:
+			ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend, ErrKafkaStorageError:
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
 				bp.parent.abandonBrokerConnection(bp.broker)
 				bp.parent.returnErrors(pSet.msgs, block.Err)
@@ -1133,7 +1148,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 
 			switch block.Err {
 			case ErrInvalidMessage, ErrUnknownTopicOrPartition, ErrLeaderNotAvailable, ErrNotLeaderForPartition,
-				ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend:
+				ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend, ErrKafkaStorageError:
 				Logger.Printf("producer/broker/%d state change to [retrying] on %s/%d because %v\n",
 					bp.broker.ID(), topic, partition, block.Err)
 				if bp.currentRetries[topic] == nil {
@@ -1206,6 +1221,22 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 // effectively a "bridge" between the flushers and the dispatcher in order to avoid deadlock
 // based on https://godoc.org/github.com/eapache/channels#InfiniteChannel
 func (p *asyncProducer) retryHandler() {
+	maxBufferLength := p.conf.Producer.Retry.MaxBufferLength
+	if 0 < maxBufferLength && maxBufferLength < minFunctionalRetryBufferLength {
+		maxBufferLength = minFunctionalRetryBufferLength
+	}
+
+	maxBufferBytes := p.conf.Producer.Retry.MaxBufferBytes
+	if 0 < maxBufferBytes && maxBufferBytes < minFunctionalRetryBufferBytes {
+		maxBufferBytes = minFunctionalRetryBufferBytes
+	}
+
+	version := 1
+	if p.conf.Version.IsAtLeast(V0_11_0_0) {
+		version = 2
+	}
+
+	var currentByteSize int64
 	var msg *ProducerMessage
 	buf := queue.New()
 
@@ -1216,7 +1247,8 @@ func (p *asyncProducer) retryHandler() {
 			select {
 			case msg = <-p.retries:
 			case p.input <- buf.Peek().(*ProducerMessage):
-				buf.Remove()
+				msgToRemove := buf.Remove().(*ProducerMessage)
+				currentByteSize -= int64(msgToRemove.ByteSize(version))
 				continue
 			}
 		}
@@ -1226,6 +1258,24 @@ func (p *asyncProducer) retryHandler() {
 		}
 
 		buf.Add(msg)
+		currentByteSize += int64(msg.ByteSize(version))
+
+		if (maxBufferLength <= 0 || buf.Length() < maxBufferLength) && (maxBufferBytes <= 0 || currentByteSize < maxBufferBytes) {
+			continue
+		}
+
+		msgToHandle := buf.Peek().(*ProducerMessage)
+		if msgToHandle.flags == 0 {
+			select {
+			case p.input <- msgToHandle:
+				buf.Remove()
+				currentByteSize -= int64(msgToHandle.ByteSize(version))
+			default:
+				buf.Remove()
+				currentByteSize -= int64(msgToHandle.ByteSize(version))
+				p.returnError(msgToHandle, ErrProducerRetryBufferOverflow)
+			}
+		}
 	}
 }
 
