@@ -3,6 +3,7 @@ package main
 // SIGUSR1 toggle the pause/resume consumption
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
@@ -28,7 +29,7 @@ var (
 func init() {
 	flag.StringVar(&brokers, "brokers", "", "Kafka bootstrap brokers to connect to, as a comma separated list")
 	flag.StringVar(&group, "group", "", "Kafka consumer group definition")
-	flag.StringVar(&version, "version", "2.1.1", "Kafka cluster version")
+	flag.StringVar(&version, "version", sarama.DefaultVersion.String(), "Kafka cluster version")
 	flag.StringVar(&topics, "topics", "", "Kafka topics to be consumed, as a comma separated list")
 	flag.StringVar(&assignor, "assignor", "range", "Consumer group partition assignment strategy (range, roundrobin, sticky)")
 	flag.BoolVar(&oldest, "oldest", true, "Kafka consumer consume initial offset from oldest")
@@ -106,6 +107,9 @@ func main() {
 			// server-side rebalance happens, the consumer session will need to be
 			// recreated to get the new claims
 			if err := client.Consume(ctx, strings.Split(topics, ","), &consumer); err != nil {
+				if errors.Is(err, sarama.ErrClosedConsumerGroup) {
+					return
+				}
 				log.Panicf("Error from consumer: %v", err)
 			}
 			// check if context was cancelled, signaling that the consumer should stop
@@ -174,6 +178,8 @@ func (consumer *Consumer) Cleanup(sarama.ConsumerGroupSession) error {
 }
 
 // ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
+// Once the Messages() channel is closed, the Handler must finish its processing
+// loop and exit.
 func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	// NOTE:
 	// Do not move the code below to a goroutine.
@@ -181,10 +187,13 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 	// https://github.com/IBM/sarama/blob/main/consumer_group.go#L27-L29
 	for {
 		select {
-		case message := <-claim.Messages():
+		case message, ok := <-claim.Messages():
+			if !ok {
+				log.Printf("message channel was closed")
+				return nil
+			}
 			log.Printf("Message claimed: value = %s, timestamp = %v, topic = %s", string(message.Value), message.Timestamp, message.Topic)
 			session.MarkMessage(message, "")
-
 		// Should return when `session.Context()` is done.
 		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
 		// https://github.com/IBM/sarama/issues/1192

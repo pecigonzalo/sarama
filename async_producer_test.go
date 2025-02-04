@@ -1,12 +1,16 @@
+//go:build !functional
+
 package sarama
 
 import (
 	"errors"
+	"github.com/stretchr/testify/assert"
 	"log"
 	"math"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,61 +21,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const TestMessage = "ABC THE MESSAGE"
-
-func closeProducerWithTimeout(t *testing.T, p AsyncProducer, timeout time.Duration) {
-	var wg sync.WaitGroup
-	p.AsyncClose()
-
-	closer := make(chan struct{})
-	timer := time.AfterFunc(timeout, func() {
-		t.Error("timeout")
-		close(closer)
-	})
-	defer timer.Stop()
-
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-closer:
-				return
-			case _, ok := <-p.Successes():
-				if !ok {
-					return
-				}
-				t.Error("Unexpected message on Successes()")
-			}
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-closer:
-				return
-			case msg, ok := <-p.Errors():
-				if !ok {
-					return
-				}
-				t.Error(msg.Err)
-			}
-		}
-	}()
-	wg.Wait()
-}
-
-func closeProducer(t *testing.T, p AsyncProducer) {
-	closeProducerWithTimeout(t, p, 5*time.Minute)
-}
-
-func expectResultsWithTimeout(t *testing.T, p AsyncProducer, successes, errors int, timeout time.Duration) {
+func expectResultsWithTimeout(t *testing.T, p AsyncProducer, successCount, errorCount int, timeout time.Duration) {
 	t.Helper()
-	expect := successes + errors
+	expect := successCount + errorCount
 	defer func() {
-		if successes != 0 || errors != 0 {
-			t.Error("Unexpected successes", successes, "or errors", errors)
+		if successCount != 0 || errorCount != 0 {
+			t.Error("Unexpected successes", successCount, "or errors", errorCount)
 		}
 	}()
 	timer := time.NewTimer(timeout)
@@ -84,26 +39,26 @@ func expectResultsWithTimeout(t *testing.T, p AsyncProducer, successes, errors i
 			if msg.Msg.flags != 0 {
 				t.Error("Message had flags set")
 			}
-			errors--
+			errorCount--
 			expect--
-			if errors < 0 {
+			if errorCount < 0 {
 				t.Error(msg.Err)
 			}
 		case msg := <-p.Successes():
 			if msg.flags != 0 {
 				t.Error("Message had flags set")
 			}
-			successes--
+			successCount--
 			expect--
-			if successes < 0 {
+			if successCount < 0 {
 				t.Error("Too many successes")
 			}
 		}
 	}
 }
 
-func expectResults(t *testing.T, p AsyncProducer, successes, errors int) {
-	expectResultsWithTimeout(t, p, successes, errors, 5*time.Minute)
+func expectResults(t *testing.T, p AsyncProducer, successCount, errorCount int) {
+	expectResultsWithTimeout(t, p, successCount, errorCount, 5*time.Minute)
 }
 
 type testPartitioner chan *int32
@@ -505,7 +460,7 @@ func TestAsyncProducerBrokerBounce(t *testing.T) {
 	// When: a broker connection gets reset by a broker (network glitch, restart, you name it).
 	leader.Close()                               // producer should get EOF
 	leader = NewMockBrokerAddr(t, 2, leaderAddr) // start it up again right away for giggles
-	seedBroker.Returns(metadataResponse)         // tell it to go to broker 2 again
+	leader.Returns(metadataResponse)             // tell it to go to broker 2 again
 
 	// Then: a produced message goes through the new broker connection.
 	producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
@@ -591,13 +546,13 @@ func TestAsyncProducerMultipleRetries(t *testing.T) {
 	metadataLeader2.AddBroker(leader2.Addr(), leader2.BrokerID())
 	metadataLeader2.AddTopicPartition("my_topic", 0, leader2.BrokerID(), nil, nil, nil, ErrNoError)
 
-	seedBroker.Returns(metadataLeader2)
+	leader1.Returns(metadataLeader2)
 	leader2.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader1)
+	leader2.Returns(metadataLeader1)
 	leader1.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader1)
+	leader1.Returns(metadataLeader1)
 	leader1.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader2)
+	leader1.Returns(metadataLeader2)
 
 	prodSuccess := new(ProduceResponse)
 	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
@@ -653,13 +608,13 @@ func TestAsyncProducerMultipleRetriesWithBackoffFunc(t *testing.T) {
 	metadataLeader2.AddTopicPartition("my_topic", 0, leader2.BrokerID(), nil, nil, nil, ErrNoError)
 
 	leader1.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader2)
+	leader1.Returns(metadataLeader2)
 	leader2.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader1)
+	leader2.Returns(metadataLeader1)
 	leader1.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader1)
+	leader1.Returns(metadataLeader1)
 	leader1.Returns(prodNotLeader)
-	seedBroker.Returns(metadataLeader2)
+	leader1.Returns(metadataLeader2)
 	leader2.Returns(prodSuccess)
 
 	expectResults(t, producer, 1, 0)
@@ -739,16 +694,17 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 	leader := NewMockBroker(t, 2)
 
 	var leaderLock sync.Mutex
-
-	// The seed broker only handles Metadata request
-	seedBroker.setHandler(func(req *request) (res encoderWithHeader) {
+	metadataRequestHandlerFunc := func(req *request) (res encoderWithHeader) {
 		leaderLock.Lock()
 		defer leaderLock.Unlock()
 		metadataLeader := new(MetadataResponse)
 		metadataLeader.AddBroker(leader.Addr(), leader.BrokerID())
 		metadataLeader.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, nil, ErrNoError)
 		return metadataLeader
-	})
+	}
+
+	// The seed broker only handles Metadata request in bootstrap
+	seedBroker.setHandler(metadataRequestHandlerFunc)
 
 	var emptyValues int32 = 0
 
@@ -770,7 +726,7 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 		}
 	}
 
-	leader.setHandler(func(req *request) (res encoderWithHeader) {
+	failedProduceRequestHandlerFunc := func(req *request) (res encoderWithHeader) {
 		countRecordsWithEmptyValue(req)
 
 		time.Sleep(50 * time.Millisecond)
@@ -778,6 +734,19 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 		prodSuccess := new(ProduceResponse)
 		prodSuccess.AddTopicPartition("my_topic", 0, ErrNotLeaderForPartition)
 		return prodSuccess
+	}
+
+	succeededProduceRequestHandlerFunc := func(req *request) (res encoderWithHeader) {
+		countRecordsWithEmptyValue(req)
+
+		prodSuccess := new(ProduceResponse)
+		prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
+		return prodSuccess
+	}
+
+	leader.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"ProduceRequest":  failedProduceRequestHandlerFunc,
+		"MetadataRequest": metadataRequestHandlerFunc,
 	})
 
 	config := NewTestConfig()
@@ -816,12 +785,9 @@ func TestAsyncProducerBrokerRestart(t *testing.T) {
 	leaderLock.Lock()
 	leader = NewMockBroker(t, 2)
 	leaderLock.Unlock()
-	leader.setHandler(func(req *request) (res encoderWithHeader) {
-		countRecordsWithEmptyValue(req)
-
-		prodSuccess := new(ProduceResponse)
-		prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
-		return prodSuccess
+	leader.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"ProduceRequest":  succeededProduceRequestHandlerFunc,
+		"MetadataRequest": metadataRequestHandlerFunc,
 	})
 
 	wg.Wait()
@@ -938,7 +904,7 @@ func TestAsyncProducerRetryWithReferenceOpen(t *testing.T) {
 	producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 
 	// tell partition 0 to go to that broker again
-	seedBroker.Returns(metadataResponse)
+	leader.Returns(metadataResponse)
 
 	// succeed this time
 	prodSuccess = new(ProduceResponse)
@@ -994,14 +960,11 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	leader.SetHandlerByMap(map[string]MockResponse{
-		"ProduceRequest": NewMockProduceResponse(t).
-			SetVersion(0).
-			SetError("my_topic", 0, ErrNoError),
-	})
-
 	// tell partition 0 to go to that broker again
-	seedBroker.Returns(metadataResponse)
+	leader.Returns(metadataResponse)
+	prodSuccess := new(ProduceResponse)
+	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
+	leader.Returns(prodSuccess)
 
 	// succeed this time
 	expectResults(t, producer, 5, 0)
@@ -1010,6 +973,9 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 0}
 	}
+	prodSuccess = new(ProduceResponse)
+	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
+	leader.Returns(prodSuccess)
 	expectResults(t, producer, 5, 0)
 
 	// shutdown
@@ -1051,7 +1017,7 @@ func TestAsyncProducerRetryShutdown(t *testing.T) {
 	prodNotLeader.AddTopicPartition("my_topic", 0, ErrNotLeaderForPartition)
 	leader.Returns(prodNotLeader)
 
-	seedBroker.Returns(metadataLeader)
+	leader.Returns(metadataLeader)
 
 	prodSuccess := new(ProduceResponse)
 	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
@@ -1111,7 +1077,7 @@ func TestAsyncProducerIdempotentGoldenPath(t *testing.T) {
 	broker := NewMockBroker(t, 1)
 
 	metadataResponse := &MetadataResponse{
-		Version:      1,
+		Version:      4,
 		ControllerID: 1,
 	}
 	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1169,7 +1135,7 @@ func TestAsyncProducerIdempotentRetryCheckBatch(t *testing.T) {
 		broker := NewMockBroker(t, 1)
 
 		metadataResponse := &MetadataResponse{
-			Version:      1,
+			Version:      4,
 			ControllerID: 1,
 		}
 		metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1307,7 +1273,7 @@ func TestAsyncProducerIdempotentRetryCheckBatch_2378(t *testing.T) {
 	broker := NewMockBroker(t, 1)
 
 	metadataResponse := &MetadataResponse{
-		Version:      1,
+		Version:      4,
 		ControllerID: 1,
 	}
 	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1375,7 +1341,7 @@ func TestAsyncProducerIdempotentErrorOnOutOfSeq(t *testing.T) {
 	broker := NewMockBroker(t, 1)
 
 	metadataResponse := &MetadataResponse{
-		Version:      1,
+		Version:      4,
 		ControllerID: 1,
 	}
 	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1425,7 +1391,7 @@ func TestAsyncProducerIdempotentEpochRollover(t *testing.T) {
 	defer broker.Close()
 
 	metadataResponse := &MetadataResponse{
-		Version:      1,
+		Version:      4,
 		ControllerID: 1,
 	}
 	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1501,7 +1467,7 @@ func TestAsyncProducerIdempotentEpochExhaustion(t *testing.T) {
 	)
 
 	metadataResponse := &MetadataResponse{
-		Version:      1,
+		Version:      4,
 		ControllerID: 1,
 	}
 	metadataResponse.AddBroker(broker.Addr(), broker.BrokerID())
@@ -1599,27 +1565,6 @@ func TestBrokerProducerShutdown(t *testing.T) {
 
 	_ = producer.Close()
 	mockBroker.Close()
-}
-
-type appendInterceptor struct {
-	i int
-}
-
-func (b *appendInterceptor) OnSend(msg *ProducerMessage) {
-	if b.i < 0 {
-		panic("hey, the interceptor has failed")
-	}
-	v, _ := msg.Value.Encode()
-	msg.Value = StringEncoder(string(v) + strconv.Itoa(b.i))
-	b.i++
-}
-
-func (b *appendInterceptor) OnConsume(msg *ConsumerMessage) {
-	if b.i < 0 {
-		panic("hey, the interceptor has failed")
-	}
-	msg.Value = []byte(string(msg.Value) + strconv.Itoa(b.i))
-	b.i++
 }
 
 func testProducerInterceptor(
@@ -1737,7 +1682,7 @@ func TestTxmngInitProducerId(t *testing.T) {
 	defer broker.Close()
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	broker.Returns(metadataLeader)
 
@@ -1780,7 +1725,7 @@ func TestTxnProduceBumpEpoch(t *testing.T) {
 	config.ApiVersionsRequest = false
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 7
+	metadataLeader.Version = 9
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -1825,7 +1770,7 @@ func TestTxnProduceBumpEpoch(t *testing.T) {
 	broker.Returns(addPartitionsToTxnResponse)
 
 	produceResponse := new(ProduceResponse)
-	produceResponse.Version = 3
+	produceResponse.Version = 7
 	produceResponse.AddTopicPartition("test-topic", 0, ErrOutOfOrderSequenceNumber)
 	broker.Returns(produceResponse)
 
@@ -1879,7 +1824,7 @@ func TestTxnProduceRecordWithCommit(t *testing.T) {
 	config.Net.MaxOpenRequests = 1
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -1960,7 +1905,7 @@ func TestTxnProduceBatchAddPartition(t *testing.T) {
 	config.Producer.Partitioner = NewManualPartitioner
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -2067,7 +2012,7 @@ func TestTxnProduceRecordWithAbort(t *testing.T) {
 	config.Net.MaxOpenRequests = 1
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -2147,7 +2092,7 @@ func TestTxnCanAbort(t *testing.T) {
 	config.Net.MaxOpenRequests = 1
 
 	metadataLeader := new(MetadataResponse)
-	metadataLeader.Version = 1
+	metadataLeader.Version = 4
 	metadataLeader.ControllerID = broker.brokerID
 	metadataLeader.AddBroker(broker.Addr(), broker.BrokerID())
 	metadataLeader.AddTopic("test-topic", ErrNoError)
@@ -2231,6 +2176,111 @@ func TestTxnCanAbort(t *testing.T) {
 
 	err = producer.AbortTxn()
 	require.NoError(t, err)
+}
+
+func TestProducerRetryBufferLimits(t *testing.T) {
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+	topic := "test-topic"
+
+	metadataRequestHandlerFunc := func(req *request) (res encoderWithHeader) {
+		r := new(MetadataResponse)
+		r.AddBroker(broker.Addr(), broker.BrokerID())
+		r.AddTopicPartition(topic, 0, broker.BrokerID(), nil, nil, nil, ErrNoError)
+		return r
+	}
+
+	produceRequestHandlerFunc := func(req *request) (res encoderWithHeader) {
+		r := new(ProduceResponse)
+		r.AddTopicPartition(topic, 0, ErrNotLeaderForPartition)
+		return r
+	}
+
+	broker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"ProduceRequest":  produceRequestHandlerFunc,
+		"MetadataRequest": metadataRequestHandlerFunc,
+	})
+
+	tests := []struct {
+		name            string
+		configureBuffer func(*Config)
+		messageSize     int
+		numMessages     int
+	}{
+		{
+			name: "MaxBufferLength",
+			configureBuffer: func(config *Config) {
+				config.Producer.Flush.MaxMessages = 1
+				config.Producer.Retry.MaxBufferLength = minFunctionalRetryBufferLength
+			},
+			messageSize: 1, // Small message size
+			numMessages: 10000,
+		},
+		{
+			name: "MaxBufferBytes",
+			configureBuffer: func(config *Config) {
+				config.Producer.Flush.MaxMessages = 1
+				config.Producer.Retry.MaxBufferBytes = minFunctionalRetryBufferBytes
+			},
+			messageSize: 950 * 1024, // 950 KB
+			numMessages: 1000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := NewTestConfig()
+			config.Producer.Return.Successes = true
+			tt.configureBuffer(config)
+
+			producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var (
+				wg                        sync.WaitGroup
+				successes, producerErrors int
+				errorFound                bool
+			)
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range producer.Successes() {
+					successes++
+				}
+			}()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for errMsg := range producer.Errors() {
+					if errors.Is(errMsg.Err, ErrProducerRetryBufferOverflow) {
+						errorFound = true
+					}
+					producerErrors++
+				}
+			}()
+
+			longString := strings.Repeat("a", tt.messageSize)
+			val := StringEncoder(longString)
+
+			for i := 0; i < tt.numMessages; i++ {
+				msg := &ProducerMessage{
+					Topic: topic,
+					Value: val,
+				}
+				producer.Input() <- msg
+			}
+
+			producer.AsyncClose()
+			wg.Wait()
+
+			assert.Equal(t, successes+producerErrors, tt.numMessages, "Expected all messages to be processed")
+			assert.True(t, errorFound, "Expected at least one error matching ErrProducerRetryBufferOverflow")
+		})
+	}
 }
 
 // This example shows how to use the producer while simultaneously
@@ -2322,13 +2372,4 @@ ProducerLoop:
 	wg.Wait()
 
 	log.Printf("Successfully produced: %d; errors: %d\n", successes, producerErrors)
-}
-
-// NewTestConfig returns a config meant to be used by tests.
-// Due to inconsistencies with the request versions the clients send using the default Kafka version
-// and the response versions our mocks use, we default to the minimum Kafka version in most tests
-func NewTestConfig() *Config {
-	config := NewConfig()
-	config.Version = MinVersion
-	return config
 }

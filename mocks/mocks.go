@@ -52,8 +52,8 @@ func messageValueChecker(f ValueChecker) MessageChecker {
 
 var (
 	errProduceSuccess              error = nil
-	errOutOfExpectations                 = errors.New("No more expectations set on mock")
-	errPartitionConsumerNotStarted       = errors.New("The partition consumer was never started")
+	errOutOfExpectations                 = errors.New("no more expectations set on mock")
+	errPartitionConsumerNotStarted       = errors.New("the partition consumer was never started")
 )
 
 const AnyOffset int64 = -1000
@@ -103,6 +103,8 @@ func (pc *TopicConfig) partitions(topic string) int32 {
 // and the response versions our mocks use, we default to the minimum Kafka version in most tests
 func NewTestConfig() *sarama.Config {
 	config := sarama.NewConfig()
+	config.Consumer.Retry.Backoff = 0
+	config.Producer.Retry.Backoff = 0
 	config.Version = sarama.MinVersion
 	return config
 }

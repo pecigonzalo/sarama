@@ -65,7 +65,7 @@ type BalanceStrategy interface {
 // Example with two topics T1 and T2 with six partitions each (0..5) and two members (M1, M2):
 //
 //	M1: {T1: [0, 1, 2], T2: [0, 1, 2]}
-//	M2: {T2: [3, 4, 5], T2: [3, 4, 5]}
+//	M2: {T1: [3, 4, 5], T2: [3, 4, 5]}
 func NewBalanceStrategyRange() BalanceStrategy {
 	return &balanceStrategy{
 		name: RangeBalanceStrategyName,
@@ -989,6 +989,7 @@ func (p *partitionMovements) getTheActualPartitionToBeMoved(partition topicParti
 	return reversePairPartition
 }
 
+//lint:ignore U1000 // this is used but only in unittests as a helper (which are excluded by the integration build tag)
 func (p *partitionMovements) isLinked(src, dst string, pairs []consumerPair, currentPath []string) ([]string, bool) {
 	if src == dst {
 		return currentPath, false
@@ -1004,24 +1005,26 @@ func (p *partitionMovements) isLinked(src, dst string, pairs []consumerPair, cur
 	}
 
 	for _, pair := range pairs {
-		if pair.SrcMemberID == src {
-			// create a deep copy of the pairs, excluding the current pair
-			reducedSet := make([]consumerPair, len(pairs)-1)
-			i := 0
-			for _, p := range pairs {
-				if p != pair {
-					reducedSet[i] = pair
-					i++
-				}
-			}
-
-			currentPath = append(currentPath, pair.SrcMemberID)
-			return p.isLinked(pair.DstMemberID, dst, reducedSet, currentPath)
+		if pair.SrcMemberID != src {
+			continue
 		}
+		// create a deep copy of the pairs, excluding the current pair
+		reducedSet := make([]consumerPair, len(pairs)-1)
+		i := 0
+		for _, p := range pairs {
+			if p != pair {
+				reducedSet[i] = pair
+				i++
+			}
+		}
+
+		currentPath = append(currentPath, pair.SrcMemberID)
+		return p.isLinked(pair.DstMemberID, dst, reducedSet, currentPath)
 	}
 	return currentPath, false
 }
 
+//lint:ignore U1000 // this is used but only in unittests as a helper (which are excluded by the integration build tag)
 func (p *partitionMovements) in(cycle []string, cycles [][]string) bool {
 	superCycle := make([]string, len(cycle)-1)
 	for i := 0; i < len(cycle)-1; i++ {
@@ -1036,6 +1039,7 @@ func (p *partitionMovements) in(cycle []string, cycles [][]string) bool {
 	return false
 }
 
+//lint:ignore U1000 // this is used but only in unittests as a helper (which are excluded by the integration build tag)
 func (p *partitionMovements) hasCycles(pairs []consumerPair) bool {
 	cycles := make([][]string, 0)
 	for _, pair := range pairs {
@@ -1067,6 +1071,7 @@ func (p *partitionMovements) hasCycles(pairs []consumerPair) bool {
 	return false
 }
 
+//lint:ignore U1000 // this is used but only in unittests as a helper (which are excluded by the integration build tag)
 func (p *partitionMovements) isSticky() bool {
 	for topic, movements := range p.PartitionMovementsByTopic {
 		movementPairs := make([]consumerPair, len(movements))
@@ -1084,6 +1089,7 @@ func (p *partitionMovements) isSticky() bool {
 	return true
 }
 
+//lint:ignore U1000 // this is used but only in unittests as a helper (which are excluded by the integration build tag)
 func indexOfSubList(source []string, target []string) int {
 	targetSize := len(target)
 	maxCandidate := len(source) - targetSize
@@ -1115,9 +1121,9 @@ type assignmentPriorityQueue []*consumerGroupMember
 func (pq assignmentPriorityQueue) Len() int { return len(pq) }
 
 func (pq assignmentPriorityQueue) Less(i, j int) bool {
-	// order asssignment priority queue in descending order using assignment-count/member-id
+	// order assignment priority queue in descending order using assignment-count/member-id
 	if len(pq[i].assignments) == len(pq[j].assignments) {
-		return strings.Compare(pq[i].id, pq[j].id) > 0
+		return pq[i].id > pq[j].id
 	}
 	return len(pq[i].assignments) > len(pq[j].assignments)
 }

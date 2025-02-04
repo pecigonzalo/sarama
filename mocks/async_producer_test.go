@@ -1,3 +1,5 @@
+//go:build !functional
+
 package mocks
 
 import (
@@ -109,7 +111,7 @@ func TestProducerWithTooManyExpectations(t *testing.T) {
 }
 
 func TestProducerFailTxn(t *testing.T) {
-	config := sarama.NewConfig()
+	config := NewTestConfig()
 	config.Producer.Transaction.ID = "test"
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Backoff = 0
@@ -130,7 +132,7 @@ func TestProducerFailTxn(t *testing.T) {
 }
 
 func TestProducerWithTxn(t *testing.T) {
-	config := sarama.NewConfig()
+	config := NewTestConfig()
 	config.Producer.Transaction.ID = "test"
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Backoff = 0
@@ -208,7 +210,7 @@ func TestProducerWithCheckerFunction(t *testing.T) {
 
 func TestProducerWithBrokenPartitioner(t *testing.T) {
 	trm := newTestReporterMock()
-	config := sarama.NewConfig()
+	config := NewTestConfig()
 	config.Producer.Partitioner = func(string) sarama.Partitioner {
 		return brokePartitioner{}
 	}
@@ -251,14 +253,15 @@ func (brokePartitioner) RequiresConsistency() bool { return false }
 func TestProducerWithInvalidConfiguration(t *testing.T) {
 	trm := newTestReporterMock()
 	config := NewTestConfig()
-	config.ClientID = "not a valid client ID"
+	config.Version = sarama.V0_11_0_2
+	config.ClientID = "not a valid producer ID"
 	mp := NewAsyncProducer(trm, config)
 	if err := mp.Close(); err != nil {
 		t.Error(err)
 	}
 	if len(trm.errors) != 1 {
 		t.Error("Expected to report a single error")
-	} else if !strings.Contains(trm.errors[0], "ClientID is invalid") {
+	} else if !strings.Contains(trm.errors[0], `ClientID value "not a valid producer ID" is not valid for Kafka versions before 1.0.0`) {
 		t.Errorf("Unexpected error: %s", trm.errors[0])
 	}
 }
